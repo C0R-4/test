@@ -66,12 +66,16 @@ const GameBack = {
             // 검 위치 (프론트에 전송할 값)
             sword: {
                 position: { x: 0, y: 0, z: 0 },
-                rotation: { x: 0, y: 0, z: 0, w: 1 }
+                rotation: { x: 0, y: 0, z: 0, w: 1 },
+                dir: { x: 0, z: 1 }     // 궤적 방향 (수직/평행 판정용)
             },
             
             // 내부 카운트
             attackCountDown: 0,         // 공격 지속 카운트
-            chargeTime: 0               // 강타 충전 시간
+            chargeTime: 0,              // 강타 충전 시간
+            stunUntil: 0,               // 기절(STUN) 해제 시각
+            recovery: 0,                // 판정 후 딜레이(다음 행동까지)
+            hitJudged: false            // 이번 스윙 판정 여부
         };
     },
     
@@ -104,7 +108,7 @@ const GameBack = {
                 break;
                 
             case "PLAYING":
-                this.handlePlaying(player, opponent, payload);
+                this.handlePlaying(player, opponent, payload, timestamp);
                 break;
                 
             default:
@@ -145,11 +149,34 @@ const GameBack = {
     // ============================================================
     // 게임 진행 중 처리 (규격 24~26번)
     // ============================================================
-    handlePlaying: function(player, opponent, payload) {
+    handlePlaying: function(player, opponent, payload, timestamp) {
+        // 0. 기절(STUN) / 딜레이 체크 - 그 동안 입력 무시
+        if (player.status === this.STATUS.STUN) {
+            if (timestamp < player.stunUntil) {
+                return; // 기절 중 - 아무것도 안 함
+            }
+            player.status = this.STATUS.IDLE; // 기절 해제
+        }
+        if (player.recovery > 0) {
+            player.recovery--;
+            if (player.recovery === 0 && player.status !== this.STATUS.STUN) {
+                // 방어/충전 상태는 유지, 나머지는 대기
+                if (player.status !== this.STATUS.DEFENSE && player.status !== this.STATUS.CHARGE) {
+                    player.status = this.STATUS.IDLE;
+                }
+            }
+            // 딜레이 중엔 다음 행동 불가 (검 위치만 갱신)
+            this.updateSwordPosition(player, payload.rotation_vector);
+            this.sendToFront(player);
+            return;
+        }
+        
         // 1. 버튼 입력 처리
-        this.processButtonInput(player, payload.button);
+        this.processButtonInput(player, payload.button, payload);
         
         // 2. 가속도로 공격 판정
+        // 제안서: "핸드폰이 볼륨키의 반대방향으로 회전하면서 해당 방향과 같은
+        // 일정 이상의 가속도를 일정 시간동안 받을 시 공격동작이 발생"
         const accel = payload.acceleration;
         const isAttacking = Math.sqrt(
             (accel.x - player.basePos.x) ** 2 +
@@ -158,21 +185,31 @@ const GameBack = {
         ) > this.ATTACK_SPEED;
         
         // 3. 상태 업데이트
-        if (isAttacking && player.status !== this.STATUS.CHARGE) {
-            player.status = this.STATUS.ATTACK;
+        // - 방어 중엔 공격 불가 (제안서: "방어 중 공격은 불가하다")
+        // - 강타 충전 완료 상태라면 휘두를 때 강타 발동
+        if (isAttacking && player.status !== this.STATUS.DEFENSE && player.status !== this.STATUS.CHARGE) {
+            if (player.status === this.STATUS.IDLE) {
+                player.status = this.STATUS.ATTACK;
+            } else if (this.isChargeReady(player)) {
+                // 충전 완료 상태에서 휘둘렀다 -> 강타
+                player.status = this.STATUS.SMASH;
+                player.chargeTime = 0;
+                console.log("[GameBack] 강타(SMASH) 발동!");
+            }
             player.attackCountDown = 10; // 10프레임 동안 공격 상태 유지
+            player.hitJudged = false;   // 이번 스윙은 아직 판정 안 함
         } else if (player.attackCountDown > 0) {
             player.attackCountDown--;
-        } else if (player.status === this.STATUS.ATTACK) {
+        } else if (player.status === this.STATUS.ATTACK || player.status === this.STATUS.SMASH) {
             player.status = this.STATUS.IDLE;
         }
         
-        // 4. 검 위치 계산 (영점 보정 반영)
+        // 4. 검 위치/궤적 계산 (영점 보정 반영)
         this.updateSwordPosition(player, payload.rotation_vector);
         
-        // 5. 충돌 체크
+        // 5. 충돌/판정 체크
         if (player.status === this.STATUS.ATTACK || player.status === this.STATUS.SMASH) {
-            this.checkCollision(player, opponent);
+            this.checkCollision(player, opponent, payload, timestamp);
         }
         
         // 6. 프론트로 데이터 전송 (규격 26번)
@@ -181,38 +218,56 @@ const GameBack = {
     
     // ============================================================
     // 버튼 입력 처리 (규격 24번 button 필드)
+    // 제안서:
+    //  - 방어(1): 현재 각도의 방어 궤적 상태로 돌입, 방어 중 궤적 변경 가능, 공격 불가
+    //  - 충전(2): 강타 충전. 충전 완료 후 휘두르면 강타 발동
+    //             충전 취소 시 초기화, 즉시 방어로 이어질 수 있고
+    //             준비 상태로 이어지면 약간의 딜레이 존재
     // ============================================================
-    processButtonInput: function(player, button) {
+    processButtonInput: function(player, button, payload) {
         switch (button) {
             case this.BUTTON.DEFEND: // 볼륨 상 - 방어
+                if (player.status === this.STATUS.STUN || player.recovery > 0) return;
                 player.status = this.STATUS.DEFENSE;
+                // 방어 중 방어 궤적(방향) 변경 가능
+                player.sword.dir = this.getTrailDir(player, payload);
+                player.chargeTime = 0; // 방어 전환 시 충전 초기화
                 break;
                 
             case this.BUTTON.CHARGE: // 볼륨 하 - 강타 충전
-                if (player.status !== this.STATUS.CHARGE) {
-                    player.status = this.STATUS.CHARGE;
-                    player.chargeTime = 0;
-                }
-                player.chargeTime++;
+                if (player.status === this.STATUS.STUN || player.recovery > 0) return;
                 
-                // 30프레임(0.5초) 이상 충전 시 강타 발동
-                if (player.chargeTime >= 30) {
-                    player.status = this.STATUS.SMASH;
-                    player.chargeTime = 0;
-                    console.log("[GameBack] 강타(SMASH) 발동!");
+                if (player.status === this.STATUS.CHARGE) {
+                    // 충전 중 계속 충전 유지
+                    player.chargeTime++;
+                } else if (player.status === this.STATUS.DEFENSE) {
+                    // 방어에서 즉시 충전으로 (제안서: "방어로 즉시 이어질 수 있으며")
+                    player.status = this.STATUS.CHARGE;
+                    player.chargeTime = 1;
+                } else if (player.status === this.STATUS.IDLE) {
+                    player.status = this.STATUS.CHARGE;
+                    player.chargeTime = 1;
                 }
                 break;
                 
             default: // 버튼 없음
                 if (player.status === this.STATUS.DEFENSE) {
+                    // 방어 해제 -> 대기
                     player.status = this.STATUS.IDLE;
                 }
                 if (player.status === this.STATUS.CHARGE) {
-                    player.status = this.STATUS.IDLE;
+                    // 충전 취소 -> 충전치 초기화, 준비 상태로 약간의 딜레이
                     player.chargeTime = 0;
+                    player.status = this.STATUS.IDLE;
+                    player.recovery = 5; // 약간의 딜레이
                 }
                 break;
         }
+    },
+    
+    // 충전이 완료되었는지 확인 (30프레임 유지 시 충전 완료)
+    isChargeReady: function(player) {
+        return player.chargeTime >= 30;
     },
     
     // ============================================================
@@ -233,6 +288,9 @@ const GameBack = {
         player.sword.position.z += dz * 0.01;
         player.sword.position.x += dx * 0.005;
         
+        // 궤적 방향 갱신 (수직/평행 판정용)
+        player.sword.dir = this.getTrailDir(player, { rotation_vector: rotVec });
+        
         // 회전값 그대로 전달 (쿼터니언 형식)
         player.sword.rotation = {
             x: dx,
@@ -248,40 +306,84 @@ const GameBack = {
     },
     
     // ============================================================
-    // 충돌 판정 (규격: 공격 중일 때 상대와 거리 체크)
+    // 궤적 방향 계산
+    // 제안서: 검 방향은 손잡이 궤적, 검 끝 궤적 점들에 따라 결정되며
+    //         rotation_vector z축에 따라 움직인다.
+    // => 검 방향을 xz 평면 2D 벡터로 근사 (검 끝 위치 변화 방향)
     // ============================================================
-    checkCollision: function(attacker, defender) {
-        // 두 검 끝 사이 거리 계산
-        const dist = Math.sqrt(
-            (attacker.sword.position.x - defender.sword.position.x) ** 2 +
-            (attacker.sword.position.z - defender.sword.position.z) ** 2
-        );
+    getTrailDir: function(player, payload) {
+        // 검 끝 이동 방향: rotation_vector z축(궤적) + x축(손잡이) 변화로
+        const z = payload.rotation_vector.z - player.basePos.z;
+        const x = payload.rotation_vector.x - player.basePos.x;
         
-        // 거리 2.0 이하이면 충돌 (프로토타입용)
-        if (dist < 2.0) {
-            console.log("[GameBack] 충돌 감지! 거리:", dist.toFixed(2));
+        // 크기가 너무 작으면 기존 방향 유지
+        if (Math.abs(x) + Math.abs(z) < 0.01) {
+            return player.sword.dir;
+        }
+        
+        // 정규화
+        const len = Math.sqrt(x * x + z * z);
+        return { x: x / len, z: z / len };
+    },
+    
+    // 두 궤적의 평행/수직 판정
+    // dot >  0.75 -> 평행 (뚫림, 공격 성공 쪽)
+    // |dot| < 0.5 -> 수직 (막힘, 패리 쪽)
+    // 그 사이    -> 경계 (평행 쪽으로 간주 - 공격 성공)
+    getRelation: function(dirA, dirB) {
+        const dot = dirA.x * dirB.x + dirA.z * dirB.z;
+        if (Math.abs(dot) < 0.5) {
+            return "PERPENDICULAR"; // 수직 -> 막힘
+        }
+        return "PARALLEL";          // 평행 -> 뚫림
+    },
+    
+    // ============================================================
+    // 판정 로직 (제안서 5×5 상호작용 표 구현)
+    //
+    // 수직일 때: 기본공격 vs 기본공격 -> 패리
+    //           기본공격/강타충전 상태의 공격 vs 방어 -> 공격실패(방어 성공)
+    // 평행일 때: 공격 vs 방어 -> 공격성공(방어 실패)
+    //           강타는 방어 불가 -> 무조건 공격성공
+    // ============================================================
+    checkCollision: function(attacker, defender, attackerPayload, timestamp) {
+        // 한 스윙에 한 번만 판정
+        if (attacker.hitJudged) return;
+        
+        // 공격자가 실제로 스윙하는 중에만 판정 (첫 프레임)
+        if (attacker.attackCountDown < 8) return;
+        
+        const relation = this.getRelation(attacker.sword.dir, defender.sword.dir);
+        attacker.hitJudged = true;
+        
+        // 방어 성공 여부: 방어 중 + 궤적이 수직
+        const defenderBlocks = defender.status === this.STATUS.DEFENSE && relation === "PERPENDICULAR";
+        
+        // 강타는 방어 불가 (제안서: "강타 충전이 완료된 상태에서 휘두를 시 강타가 나간다. 방어 불가")
+        const smashIgnoresDefense = attacker.status === this.STATUS.SMASH;
+        
+        if (defenderBlocks && !smashIgnoresDefense) {
+            // === 공격 실패 / 방어 성공 ===
+            // 공격자: 기절(STUN) - 일정시간 방어만 가능, 공격 불가
+            attacker.status = this.STATUS.STUN;
+            attacker.stunUntil = timestamp + 800;
+            // 방어자: 딜레이 없이 다음 행동 가능
+            console.log("[GameBack] 수직 판정 - 공격 실패/방어 성공! 공격자 기절");
+        } else {
+            // === 공격 성공 / 방어 실패 ===
+            const damage = attacker.status === this.STATUS.SMASH ? 2 : 1;
+            defender.hp -= damage;
+            // 공격자도 "다음 행동까지 약간의 딜레이"
+            attacker.recovery = 10;
+            // 방어자도 같은 시간의 딜레이
+            defender.recovery = 10;
+            if (defender.status === this.STATUS.DEFENSE) defender.status = this.STATUS.IDLE;
             
-            // 방어 중이면 공격자 기절(STUN)
-            if (defender.status === this.STATUS.DEFENSE) {
-                attacker.status = this.STATUS.STUN;
-                setTimeout(() => {
-                    if (attacker.status === this.STATUS.STUN) {
-                        attacker.status = this.STATUS.IDLE;
-                    }
-                }, 500);
-                console.log("[GameBack] 방어 성공! 공격자 기절");
-            } else {
-                // 일반 공격: HP 1 감소
-                // 강타: HP 2 감소
-                const damage = attacker.status === this.STATUS.SMASH ? 2 : 1;
-                defender.hp -= damage;
-                
-                console.log("[GameBack] 피격! 데미지:", damage, "남은 HP:", defender.hp);
-                
-                // HP 0이면 게임 종료
-                if (defender.hp <= 0) {
-                    this.endGame(attacker.id, defender.id);
-                }
+            console.log(`[GameBack] ${relation === "PARALLEL" ? "평행" : "강타"} 판정 - 공격 성공! 데미지 ${damage}, 방어자 HP=${defender.hp}`);
+            
+            // HP 0이면 게임 종료
+            if (defender.hp <= 0) {
+                this.endGame(attacker.id, defender.id, timestamp);
             }
         }
     },
