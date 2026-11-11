@@ -75,7 +75,7 @@ const GameBack = {
             chargeTime: 0,              // 강타 충전 시간
             stunUntil: 0,               // 기절(STUN) 해제 시각
             recovery: 0,                // 판정 후 딜레이(다음 행동까지)
-            hitJudged: false            // 이번 스윙 판정 여부
+            pendingSwing: null          // 판정 대기 중인 스윙 { ts }
         };
     },
     
@@ -187,17 +187,19 @@ const GameBack = {
         // 3. 상태 업데이트
         // - 방어 중엔 공격 불가 (제안서: "방어 중 공격은 불가하다")
         // - 강타 충전 완료 상태라면 휘두를 때 강타 발동
+        // - 스윙 시작 시 pendingSwing 기록 (200ms 윈도우 내 상대 스윙과 동시 판정)
         if (isAttacking && player.status !== this.STATUS.DEFENSE && player.status !== this.STATUS.CHARGE) {
             if (player.status === this.STATUS.IDLE) {
                 player.status = this.STATUS.ATTACK;
+                player.pendingSwing = { ts: timestamp };
             } else if (this.isChargeReady(player)) {
                 // 충전 완료 상태에서 휘둘렀다 -> 강타
                 player.status = this.STATUS.SMASH;
                 player.chargeTime = 0;
+                player.pendingSwing = { ts: timestamp };
                 console.log("[GameBack] 강타(SMASH) 발동!");
             }
             player.attackCountDown = 10; // 10프레임 동안 공격 상태 유지
-            player.hitJudged = false;   // 이번 스윙은 아직 판정 안 함
         } else if (player.attackCountDown > 0) {
             player.attackCountDown--;
         } else if (player.status === this.STATUS.ATTACK || player.status === this.STATUS.SMASH) {
@@ -208,9 +210,7 @@ const GameBack = {
         this.updateSwordPosition(player, payload.rotation_vector);
         
         // 5. 충돌/판정 체크
-        if (player.status === this.STATUS.ATTACK || player.status === this.STATUS.SMASH) {
-            this.checkCollision(player, opponent, payload, timestamp);
-        }
+        this.checkCollision(player, opponent, timestamp);
         
         // 6. 프론트로 데이터 전송 (규격 26번)
         this.sendToFront(player);
@@ -339,52 +339,60 @@ const GameBack = {
     },
     
     // ============================================================
-    // 판정 로직 (제안서 5×5 상호작용 표 구현)
-    //
-    // 수직일 때: 기본공격 vs 기본공격 -> 패리
-    //           기본공격/강타충전 상태의 공격 vs 방어 -> 공격실패(방어 성공)
-    // 평행일 때: 공격 vs 방어 -> 공격성공(방어 실패)
-    //           강타는 방어 불가 -> 무조건 공격성공
+    // 판정 로직 (제안서 5×5 상호작용 표 + 패리/상호공격 구현)
     // ============================================================
-    checkCollision: function(attacker, defender, attackerPayload, timestamp) {
-        // 한 스윙에 한 번만 판정
-        if (attacker.hitJudged) return;
+    checkCollision: function(attacker, defender, timestamp) {
+        if (!attacker.pendingSwing) return;
         
-        // 공격자가 실제로 스윙하는 중에만 판정 (첫 프레임)
-        if (attacker.attackCountDown < 8) return;
+        // 상대방도 스윙 중인가? (200ms 판정 윈도우)
+        const simultaneousSwing = defender.pendingSwing && Math.abs(attacker.pendingSwing.ts - defender.pendingSwing.ts) < 200;
+        
+        // 아직 판정 시간이 더 필요하면 대기 (상대 데이터가 더 늦게 올 수 있음)
+        // 단, 200ms가 지났으면 단독 판정 진행
+        if (defender.pendingSwing && !simultaneousSwing && (timestamp - attacker.pendingSwing.ts < 200)) return;
         
         const relation = this.getRelation(attacker.sword.dir, defender.sword.dir);
-        attacker.hitJudged = true;
         
-        // 방어 성공 여부: 방어 중 + 궤적이 수직
+        if (simultaneousSwing) {
+            // === 상호작용: 패리 / 상호공격 / 교차 강타 ===
+            attacker.pendingSwing = null;
+            defender.pendingSwing = null;
+            
+            if (relation === "PERPENDICULAR") {
+                // 수직일 때: 패리 (제안서: "상호간 공격이 막혔다. 체력 변동 없이 딜레이")
+                console.log("[GameBack] 판정: 패리(Parry)!");
+                attacker.recovery = 15;
+                defender.recovery = 15;
+            } else {
+                // 평행일 때: 상호공격 (제안서: "양 측 모두 체력 1 깎이며 딜레이")
+                console.log("[GameBack] 판정: 상호공격(Mutual Hit)!");
+                attacker.hp -= 1;
+                defender.hp -= 1;
+                attacker.recovery = 15;
+                defender.recovery = 15;
+                if (attacker.hp <= 0 || defender.hp <= 0) this.endGame(attacker.hp > 0 ? attacker.id : defender.id, attacker.hp <= 0 ? attacker.id : defender.id);
+            }
+            return;
+        }
+
+        // === 단독 공격 판정 (상대는 스윙 안 함) ===
+        attacker.pendingSwing = null;
         const defenderBlocks = defender.status === this.STATUS.DEFENSE && relation === "PERPENDICULAR";
-        
-        // 강타는 방어 불가 (제안서: "강타 충전이 완료된 상태에서 휘두를 시 강타가 나간다. 방어 불가")
         const smashIgnoresDefense = attacker.status === this.STATUS.SMASH;
         
         if (defenderBlocks && !smashIgnoresDefense) {
-            // === 공격 실패 / 방어 성공 ===
-            // 공격자: 기절(STUN) - 일정시간 방어만 가능, 공격 불가
+            // 공격 실패 / 방어 성공 (공격자 기절)
             attacker.status = this.STATUS.STUN;
             attacker.stunUntil = timestamp + 800;
-            // 방어자: 딜레이 없이 다음 행동 가능
-            console.log("[GameBack] 수직 판정 - 공격 실패/방어 성공! 공격자 기절");
+            console.log("[GameBack] 판정: 방어 성공!");
         } else {
-            // === 공격 성공 / 방어 실패 ===
+            // 공격 성공 / 방어 실패
             const damage = attacker.status === this.STATUS.SMASH ? 2 : 1;
             defender.hp -= damage;
-            // 공격자도 "다음 행동까지 약간의 딜레이"
             attacker.recovery = 10;
-            // 방어자도 같은 시간의 딜레이
             defender.recovery = 10;
-            if (defender.status === this.STATUS.DEFENSE) defender.status = this.STATUS.IDLE;
-            
-            console.log(`[GameBack] ${relation === "PARALLEL" ? "평행" : "강타"} 판정 - 공격 성공! 데미지 ${damage}, 방어자 HP=${defender.hp}`);
-            
-            // HP 0이면 게임 종료
-            if (defender.hp <= 0) {
-                this.endGame(attacker.id, defender.id, timestamp);
-            }
+            console.log(`[GameBack] 판정: 공격 성공! (${damage} 데미지)`);
+            if (defender.hp <= 0) this.endGame(attacker.id, defender.id);
         }
     },
     
