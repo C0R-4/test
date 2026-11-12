@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GUM FIELD - 게임 백엔드 판정 테스트</title>
+<style>
+    * { box-sizing: border-box; }
+    body {
+        margin: 0; background: #0d1117; color: #e6edf3;
+        font-family: 'Consolas', 'Malgun Gothic', monospace;
+        padding: 20px;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px 0; }
+    .sub { color: #8b949e; font-size: 13px; margin-bottom: 20px; }
+    .layout { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 300px; }
+
+    .panel {
+        background: #161b22; border: 1px solid #30363d;
+        border-radius: 8px; padding: 14px 16px; margin-bottom: 14px;
+    }
+    .panel h2 { font-size: 14px; margin: 0 0 12px 0; color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+
+    .gamestate { display: flex; align-items: center; gap: 10px; }
+    .badge {
+        display: inline-block; padding: 6px 14px; border-radius: 20px;
+        font-weight: bold; font-size: 14px;
+    }
+    .badge.WAITING { background: #30363d; color: #8b949e; }
+    .badge.CALIBRATING { background: #1f6feb33; color: #58a6ff; }
+    .badge.PLAYING { background: #1a7f3733; color: #3fb950; }
+    .badge.ENDED { background: #da363333; color: #f85149; }
+
+    .players { display: flex; gap: 12px; }
+    .player {
+        flex: 1; background: #0d1117; border: 1px solid #30363d;
+        border-radius: 6px; padding: 12px;
+    }
+    .player .pid { font-weight: bold; font-size: 15px; margin-bottom: 8px; }
+    .player.p1 .pid { color: #58a6ff; }
+    .player.p2 .pid { color: #d2a8ff; }
+    .stat-row { display: flex; justify-content: space-between; font-size: 13px; margin: 4px 0; }
+    .stat-row .lbl { color: #8b949e; }
+
+    .hpbar { display: flex; gap: 3px; margin-top: 6px; }
+    .hp { width: 18px; height: 10px; background: #30363d; border-radius: 2px; }
+    .hp.on { background: #3fb950; }
+    .hp.low { background: #f85149; }
+
+    .status-tag {
+        display: inline-block; padding: 2px 8px; border-radius: 4px;
+        font-size: 12px; font-weight: bold;
+    }
+    .st-IDLE { background: #30363d; color: #8b949e; }
+    .st-ATTACK { background: #da363333; color: #f85149; }
+    .st-DEFENSE { background: #1a7f3733; color: #3fb950; }
+    .st-CHARGE { background: #bb800933; color: #e3b341; }
+    .st-SMASH { background: #db6d2833; color: #f0883e; }
+    .st-STUN { background: #6e768133; color: #8b949e; }
+
+    .btns { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+    button {
+        font-family: inherit; font-size: 13px; cursor: pointer;
+        background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+        padding: 10px 12px; border-radius: 6px; transition: background .15s;
+    }
+    button:hover { background: #30363d; }
+    button:active { transform: translateY(1px); }
+    button.setup { background: #1f6feb33; border-color: #1f6feb; }
+    button.setup:hover { background: #1f6feb55; }
+    button.attack { border-color: #da3633; }
+    button.defend { border-color: #1a7f37; }
+    button.smash { border-color: #db6d28; }
+
+    .log {
+        height: 340px; overflow-y: auto; background: #0d1117;
+        border: 1px solid #30363d; border-radius: 6px; padding: 10px;
+        font-size: 12px; line-height: 1.7; white-space: pre-wrap;
+    }
+    .log .sys { color: #8b949e; }
+    .log .hit { color: #f85149; }
+    .log .block { color: #3fb950; }
+    .log .parry { color: #58a6ff; }
+    .log .info { color: #e6edf3; }
+    .hint { color: #8b949e; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+    <h1>⚔️ GUM FIELD — 게임 백엔드 판정 테스트</h1>
+    <div class="sub">back.js를 그대로 로드하고 가상 센서 데이터로 각 판정 로직을 검증합니다. 코드 수정 없이 테스트만 수행합니다.</div>
+
+    <div class="layout">
+        <div class="col">
+            <div class="panel">
+                <h2>게임 상태</h2>
+                <div class="gamestate">
+                    <span>현재: </span>
+                    <span id="game-state" class="badge WAITING">WAITING</span>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>플레이어</h2>
+                <div class="players">
+                    <div class="player p1">
+                        <div class="pid">🔵 PLAYER_1</div>
+                        <div class="stat-row"><span class="lbl">상태</span><span id="p1-status" class="status-tag st-IDLE">IDLE</span></div>
+                        <div class="stat-row"><span class="lbl">체력</span><span id="p1-hp-text">5/5</span></div>
+                        <div class="hpbar" id="p1-hp"></div>
+                        <div class="stat-row"><span class="lbl">강타 충전</span><span id="p1-charge">0</span></div>
+                    </div>
+                    <div class="player p2">
+                        <div class="pid">🟣 PLAYER_2</div>
+                        <div class="stat-row"><span class="lbl">상태</span><span id="p2-status" class="status-tag st-IDLE">IDLE</span></div>
+                        <div class="stat-row"><span class="lbl">체력</span><span id="p2-hp-text">5/5</span></div>
+                        <div class="hpbar" id="p2-hp"></div>
+                        <div class="stat-row"><span class="lbl">강타 충전</span><span id="p2-charge">0</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2>시나리오</h2>
+                <div class="btns">
+                    <button class="setup" onclick="runSetup()">1. 방 생성 + 영점 (시작)</button>
+                    <button class="setup" onclick="resetAll()">초기화 (리셋)</button>
+                    <button class="attack" onclick="runSingleAttack()">단독 공격</button>
+                    <button class="defend" onclick="runVerticalDefense()">수직 + 방어 (기절)</button>
+                    <button class="attack" onclick="runParallelDefense()">평행 + 방어 (뚫림)</button>
+                    <button class="attack" onclick="runParry()">패리 (수직 동시)</button>
+                    <button class="attack" onclick="runMutual()">상호공격 (평행 동시)</button>
+                    <button class="smash" onclick="runSmash()">강타 (방어 불가)</button>
+                    <button class="smash" onclick="runChargeCancel()">충전 후 취소</button>
+                    <button class="smash" onclick="runKO()">KO (체력 0)</button>
+                </div>
+                <div class="hint">※ 먼저 "1. 방 생성 + 영점"을 눌러 게임을 시작하세요. 그 후 각 시나리오 버튼을 누르면 해당 판정이 재현됩니다.</div>
+            </div>
+        </div>
+
+        <div class="col">
+            <div class="panel">
+                <h2>판정 로그</h2>
+                <div class="log" id="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 기존 front.js는 Three.js 의존성이 있어 테스트에서는 불러오지 않음 (back.js는 typeof 안전검사라 정상 동작) -->
+    <script src="back.js"></script>
+
+    <script>
+        // ===== console.log 캡처 (back.js의 로그를 화면에 표시) =====
+        const logEl = document.getElementById('log');
+        const _origLog = console.log;
+        console.log = function(...args) {
+            _origLog.apply(console, args);
+            const text = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+            appendLog(text);
+        };
+
+        function appendLog(text, cls) {
+            const line = document.createElement('div');
+            line.className = cls || 'info';
+            if (text.includes('공격 성공')) cls = 'hit';
+            else if (text.includes('방어 성공') || text.includes('STUN')) cls = 'block';
+            else if (text.includes('패리') || text.includes('Mutual')) cls = 'parry';
+            line.textContent = text;
+            logEl.appendChild(line);
+            logEl.scrollTop = logEl.scrollHeight;
+            // 로그 최대 200줄 유지
+            while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+        }
+
+        // ===== UI 갱신 =====
+        function refreshUI() {
+            const B = GameBack;
+            const gs = document.getElementById('game-state');
+            gs.textContent = B.gameState;
+            gs.className = 'badge ' + B.gameState;
+
+            updatePlayer('p1', B.players.PLAYER_1);
+            updatePlayer('p2', B.players.PLAYER_2);
+        }
+
+        function updatePlayer(prefix, p) {
+            if (!p) return;
+            const st = document.getElementById(prefix + '-status');
+            st.textContent = p.status;
+            st.className = 'status-tag st-' + p.status;
+            document.getElementById(prefix + '-hp-text').textContent = Math.max(0, p.hp) + '/' + B_MAX_HP();
+            document.getElementById(prefix + '-charge').textContent = p.chargeTime;
+
+            const hpBar = document.getElementById(prefix + '-hp');
+            hpBar.innerHTML = '';
+            for (let i = 0; i < B_MAX_HP(); i++) {
+                const d = document.createElement('div');
+                d.className = 'hp' + (i < p.hp ? (p.hp <= 1 ? ' on low' : ' on') : '');
+                hpBar.appendChild(d);
+            }
+        }
+        function B_MAX_HP() { return GameBack.MAX_HP; }
+
+        // 0.6초마다 상태 자동 갱신 (STUN 해제, attackCountDown 등 시간 기반 변화 반영)
+        setInterval(refreshUI, 300);
+
+        // ===== 센서 패킷 헬퍼 =====
+        function sensor(x, y, z, w, ax, ay, az, button) {
+            return {
+                rotation_vector: { x, y, z, w },
+                acceleration: { x: ax, y: ay, z: az },
+                button: button || 0
+            };
+        }
+
+        let simTime = 1000;
+        function T() { simTime += 16; return simTime; } // 다음 프레임 시점
+
+        // ===== 공통: 라운드 리셋 (체력/상태 초기화, gameState 유지) =====
+        function resetRound() {
+            const B = GameBack;
+            ['PLAYER_1', 'PLAYER_2'].forEach(id => {
+                const p = B.players[id];
+                p.hp = B.MAX_HP;
+                p.status = B.STATUS.IDLE;
+                p.recovery = 0;
+                p.stunUntil = 0;
+                p.chargeTime = 0;
+                p.attackCountDown = 0;
+                p.pendingSwing = null;
+            });
+            appendLog('--- 라운드 리셋 ---', 'sys');
+            refreshUI();
+        }
+
+        function requirePlaying() {
+            if (GameBack.gameState !== 'PLAYING') {
+                appendLog('⚠️ 먼저 "1. 방 생성 + 영점"으로 게임을 시작하세요.', 'sys');
+                return false;
+            }
+            return true;
+        }
+
+        // ===== 시나리오 =====
+
+        // 1. 방 생성 + 양쪽 영점 -> PLAYING
+        function runSetup() {
+            const B = GameBack;
+            appendLog('=== 시나리오: 방 생성 + 영점 보정 ===', 'sys');
+            B.init();
+            B.onRoomCreated({ room_pin: 'DEMO12', qr_data: '{"server_url":"ws://demo"}' });
+            // P1 센서 + 영점
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0.1, 0, 0.2, 1, 0, -1, 0));
+            B.onCalibrateConfirm('PLAYER_1');
+            // P2 센서 + 영점
+            B.onReceiveSensorData('PLAYER_2', T(), sensor(-0.1, 0, -0.2, 1, 0, -1, 0));
+            B.onCalibrateConfirm('PLAYER_2');
+            refreshUI();
+            appendLog('✅ 게임 시작! 이제 시나리오 버튼을 누르세요.', 'sys');
+        }
+
+        function resetAll() {
+            const B = GameBack;
+            B.init();
+            appendLog('=== 전체 초기화 ===', 'sys');
+            refreshUI();
+        }
+
+        // 2. 단독 공격: P1(+z) 스윙, P2 무방비 -> P2 -1
+        function runSingleAttack() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 단독 공격 (P1) ===', 'sys');
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 1, 1, 0, -1, 6));   // 스윙 (+z, 가속도 6)
+            B.onReceiveSensorData('PLAYER_1', T() + 200, sensor(0, 0, 1, 1, 0, -1, 0)); // 200ms 후 판정 확정
+            refreshUI();
+        }
+
+        // 3. 수직 + 방어: P2(+x) 방어, P1(+z) 스윙 -> 공격자 기절
+        function runVerticalDefense() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 수직 + 방어 (기절) ===', 'sys');
+            B.onReceiveSensorData('PLAYER_2', T(), sensor(1, 0, 0, 1, 0, -1, 0, 1)); // P2 +x 방향 방어
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 1, 1, 0, -1, 6));   // P1 +z 스윙 (수직)
+            B.onReceiveSensorData('PLAYER_1', T() + 200, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+        }
+
+        // 4. 평행 + 방어: P2(+z) 방어, P1(+z) 스윙 -> 방어 실패, P2 -1
+        function runParallelDefense() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 평행 + 방어 (뚫림) ===', 'sys');
+            B.onReceiveSensorData('PLAYER_2', T(), sensor(0, 0, 1, 1, 0, -1, 0, 1)); // P2 +z 방향 방어
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 1, 1, 0, -1, 6));   // P1 +z 스윙 (평행 -> 뚫림)
+            B.onReceiveSensorData('PLAYER_1', T() + 200, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+        }
+
+        // 5. 패리: 200ms 내 동시 스윙 + 수직 -> 체력 변동 없음
+        function runParry() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 패리 (수직 동시 스윙) ===', 'sys');
+            const t = T();
+            B.onReceiveSensorData('PLAYER_1', t, sensor(0, 0, 1, 1, 0, -1, 6));     // P1 +z
+            B.onReceiveSensorData('PLAYER_2', t + 50, sensor(1, 0, 0, 1, 0, -1, 6)); // P2 +x (수직)
+            B.onReceiveSensorData('PLAYER_1', t + 210, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+        }
+
+        // 6. 상호공격: 200ms 내 동시 스윙 + 평행 -> 양측 -1
+        function runMutual() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 상호공격 (평행 동시 스윙) ===', 'sys');
+            const t = T();
+            B.onReceiveSensorData('PLAYER_1', t, sensor(0, 0, 1, 1, 0, -1, 6));   // P1 +z
+            B.onReceiveSensorData('PLAYER_2', t + 30, sensor(0, 0, 1, 1, 0, -1, 6)); // P2 +z (평행)
+            B.onReceiveSensorData('PLAYER_1', t + 210, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+        }
+
+        // 7. 강타: P2 수직 방어, P1 충전완료 후 스윙 -> -2 (방어 불가)
+        function runSmash() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 강타 (방어 불가) ===', 'sys');
+            B.onReceiveSensorData('PLAYER_2', T(), sensor(1, 0, 0, 1, 0, -1, 0, 1)); // P2 +x 방어
+            B.players.PLAYER_1.chargeTime = 30;  // 충전 완료 상태
+            const t = T();
+            B.onReceiveSensorData('PLAYER_1', t, sensor(0, 0, 1, 1, 0, -1, 6));   // P1 스윙 -> SMASH
+            B.onReceiveSensorData('PLAYER_1', t + 200, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+        }
+
+        // 8. 충전 후 취소
+        function runChargeCancel() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: 충전 후 취소 (딜레이) ===', 'sys');
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 0, 1, 0, -1, 0, 2)); // 충전 시작
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 0, 1, 0, -1, 0, 2));
+            B.onReceiveSensorData('PLAYER_1', T(), sensor(0, 0, 0, 1, 0, -1, 0));      // 취소
+            appendLog('→ 상태: ' + B.players.PLAYER_1.status + ', 충전치: ' + B.players.PLAYER_1.chargeTime + ', 딜레이: ' + B.players.PLAYER_1.recovery, 'sys');
+            refreshUI();
+        }
+
+        // 9. KO: P2 체력 1로 두고 P1 공격 -> 게임 종료
+        function runKO() {
+            if (!requirePlaying()) return;
+            const B = GameBack;
+            resetRound();
+            appendLog('=== 시나리오: KO (체력 0) ===', 'sys');
+            B.players.PLAYER_2.hp = 1;
+            refreshUI();
+            const t = T();
+            B.onReceiveSensorData('PLAYER_1', t, sensor(0, 0, 1, 1, 0, -1, 6));
+            B.onReceiveSensorData('PLAYER_1', t + 200, sensor(0, 0, 1, 1, 0, -1, 0));
+            refreshUI();
+            if (B.gameState === 'ENDED') {
+                appendLog('🏁 게임 종료! "1. 방 생성 + 영점"으로 다시 시작하세요.', 'sys');
+            }
+        }
+
+        // 최초 로드 시 초기 상태 표시
+        refreshUI();
+        appendLog('back.js 로드 완료. "1. 방 생성 + 영점" 버튼으로 시작하세요.', 'sys');
+    </script>
+</body>
+</html>
