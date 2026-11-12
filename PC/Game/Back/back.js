@@ -62,6 +62,7 @@ const GameBack = {
             
             // 영점 보정용 기준값
             basePos: { x: 0, y: 0, z: 0 },
+            calibrated: false,
             
             // 검 위치 (프론트에 전송할 값)
             sword: {
@@ -119,33 +120,39 @@ const GameBack = {
     // ============================================================
     // 영점 보정 단계 처리 (규격 21~23번)
     // ============================================================
+    // network.js는 센서 데이터를 emit('onSensorData', ...)로,
+    // 영점 완료 신호를 emit('onCalibrateConfirm', ...)로 각각 전달.
+    // handleCalibration: 센서 데이터로 기준값 저장
+    // onCalibrateConfirm: 완료 신호로 영점 처리
     handleCalibration: function(player, payload) {
         // 첫 데이터면 기준값 저장
         if (!player.basePos.x && !player.basePos.y && !player.basePos.z) {
-            player.basePos = { 
+            player.basePos = {
                 x: payload.acceleration.x,
                 y: payload.acceleration.y,
                 z: payload.acceleration.z
             };
             console.log("[GameBack] 영점 기준값 저장:", player.basePos);
-            
-            // 두 사람 다 영점 완료하면 게임 시작
-            const p1 = this.players.PLAYER_1;
-            const p2 = this.players.PLAYER_2;
-            if ((p1.basePos.x || p1.basePos.y || p1.basePos.z) &&
-                (p2.basePos.x || p2.basePos.y || p2.basePos.z)) {
-                this.gameState = "PLAYING";
-                console.log("[GameBack] 영점 완료! 게임 시작!");
-                
-                // 프론트에 게임 시작 알림
-                this.sendToFront({
-                    action: "START_GAME",
-                    message: "게임이 시작됩니다!"
-                });
-            }
         }
     },
-    
+
+    // 규격 21~22번: 영점 확인(CALIBRATE_CONFIRM) 신호 수신 -> 영점 완료
+    onCalibrateConfirm: function(playerId) {
+        const player = this.players[playerId];
+        if (!player) return;
+
+        player.calibrated = true;
+        console.log("[GameBack] 영점 확인:", playerId);
+
+        // 두 사람 다 영점 완료하면 게임 시작
+        if (this.players.PLAYER_1.calibrated && this.players.PLAYER_2.calibrated) {
+            this.gameState = "PLAYING";
+            console.log("[GameBack] 영점 완료! 게임 시작!");
+            // 규격 23번: 영점 조절 완료 및 본 화면 전환 지시
+            this.showUI("START_MAIN_GAME");
+        }
+    },
+
     // ============================================================
     // 게임 진행 중 처리 (규격 24~26번)
     // ============================================================
@@ -190,14 +197,21 @@ const GameBack = {
         // - 스윙 시작 시 pendingSwing 기록 (200ms 윈도우 내 상대 스윙과 동시 판정)
         if (isAttacking && player.status !== this.STATUS.DEFENSE && player.status !== this.STATUS.CHARGE) {
             if (player.status === this.STATUS.IDLE) {
-                player.status = this.STATUS.ATTACK;
+                if (this.isChargeReady(player)) {
+                    // 충전 완료 상태에서 휘둘렀다 -> 강타
+                    player.status = this.STATUS.SMASH;
+                    player.chargeTime = 0;
+                    console.log("[GameBack] 강타(SMASH) 발동!");
+                } else {
+                    player.status = this.STATUS.ATTACK;
+                }
                 player.pendingSwing = { ts: timestamp };
             } else if (this.isChargeReady(player)) {
                 // 충전 완료 상태에서 휘둘렀다 -> 강타
                 player.status = this.STATUS.SMASH;
                 player.chargeTime = 0;
-                player.pendingSwing = { ts: timestamp };
                 console.log("[GameBack] 강타(SMASH) 발동!");
+                player.pendingSwing = { ts: timestamp };
             }
             player.attackCountDown = 10; // 10프레임 동안 공격 상태 유지
         } else if (player.attackCountDown > 0) {
@@ -343,13 +357,13 @@ const GameBack = {
     // ============================================================
     checkCollision: function(attacker, defender, timestamp) {
         if (!attacker.pendingSwing) return;
-        
+
         // 상대방도 스윙 중인가? (200ms 판정 윈도우)
         const simultaneousSwing = defender.pendingSwing && Math.abs(attacker.pendingSwing.ts - defender.pendingSwing.ts) < 200;
-        
-        // 아직 판정 시간이 더 필요하면 대기 (상대 데이터가 더 늦게 올 수 있음)
-        // 단, 200ms가 지났으면 단독 판정 진행
-        if (defender.pendingSwing && !simultaneousSwing && (timestamp - attacker.pendingSwing.ts < 200)) return;
+
+        // 200ms 윈도우 내라면 상대 스윙이 더 올 수 있으니 대기
+        // (상대가 스윙 안 해도 패리/상호공격 가능성을 위해 200ms 대기)
+        if (!simultaneousSwing && (timestamp - attacker.pendingSwing.ts < 200)) return;
         
         const relation = this.getRelation(attacker.sword.dir, defender.sword.dir);
         
@@ -411,6 +425,72 @@ const GameBack = {
         });
     },
     
+    // ============================================================
+    // 네트워크 이벤트 핸들러 (network.js의 handlers 콜백)
+    // 규격 3~4번:  Net → Back → Front  방 생성 완료 및 UI 출력 지시
+    // 규격 13~14번: Net → Back → Front 플레이어 연결 완료 알림
+    //
+    // QR 코드는 서버가 생성(room_pin/qr_data), 프론트가 렌더링.
+    // 백은 이 데이터를 프론트로 전달만 한다.
+    // ============================================================
+    startRoom: function(serverUrl) {
+        if (typeof GameNetwork === "undefined") {
+            throw new Error("network.js가 로드되지 않았습니다");
+        }
+        return GameNetwork.createRoom(serverUrl, {
+            onRoomCreated: function(room) { GameBack.onRoomCreated(room); },
+            onPlayerState: function(playerId, state) { GameBack.onPlayerState(playerId, state); },
+            onRoomClosed: function() { GameBack.onRoomClosed(); },
+            onError: function(err) { GameBack.onNetworkError(err); }
+        });
+    },
+
+    // 규격 3~4번: 대기방 생성 완료 -> 프론트에 QR/PIN 출력 지시
+    onRoomCreated: function(room) {
+        console.log("[GameBack] 대기방 생성:", room.room_pin);
+        this.gameState = "CALIBRATING"; // 영점 보정 단계로 전환
+        this.showUI("SHOW_WAITING_ROOM", {
+            room_pin: room.room_pin,
+            qr_data: room.qr_data
+        });
+    },
+
+    // 규격 13~14번: 플레이어 P2P 연결 완료 -> 대기방 UI 갱신 지시
+    onPlayerState: function(playerId, state) {
+        if (state === "ready") {
+            console.log("[GameBack] 플레이어 연결 완료:", playerId);
+            this.showUI("UPDATE_PLAYER_READY", { connected_id: playerId });
+        } else if (state === "disconnected") {
+            console.log("[GameBack] 플레이어 이탈:", playerId);
+            this.showUI("UPDATE_PLAYER_LEFT", { left_id: playerId });
+        }
+    },
+
+    // 방 종료
+    onRoomClosed: function() {
+        console.log("[GameBack] 대기방 종료");
+        this.gameState = "WAITING";
+        this.myPlayerId = null;
+        this.players.PLAYER_1 = this.createPlayer("PLAYER_1");
+        this.players.PLAYER_2 = this.createPlayer("PLAYER_2");
+    },
+
+    // 네트워크 오류
+    onNetworkError: function(err) {
+        console.error("[GameBack] 네트워크 오류:", err.code, err.message);
+        this.showUI("SHOW_ERROR", { message: err.message });
+    },
+
+    // ============================================================
+    // 프론트 UI 지시 전달 (규격의 ui_command)
+    // ============================================================
+    showUI: function(ui_command, data) {
+        console.log(`[GameBack->Front] ${ui_command}`, data);
+        if (typeof frontApp !== "undefined" && typeof frontApp.showUI === "function") {
+            frontApp.showUI(ui_command, data);
+        }
+    },
+
     // ============================================================
     // 프론트로 데이터 전송 (규격 26번: front.updateRender(...))
     // ============================================================
